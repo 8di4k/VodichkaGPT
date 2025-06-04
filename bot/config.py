@@ -12,7 +12,7 @@ with open(config_dir / "config.yml", 'r') as f:
 config_env = dotenv.dotenv_values(config_dir / "config.env")
 
 # YooKassa provider token for Bot Payments API
-YOOKASSA_PROVIDER_TOKEN = 't390540012:LIVE:42354' # VodichkaGPT real
+YOOKASSA_PROVIDER_TOKEN = '390540012:LIVE:42354' # VodichkaGPT real
 
 # config parameters
 telegram_token = config_yaml["telegram_token"]

@@ -4,14 +4,16 @@ import asyncio
 import traceback
 import html
 import json
-import cv2
 import tempfile
 import requests
 import openai
+import base64
+
 from pathlib import Path
 from datetime import datetime, timedelta
 from pytesseract import image_to_string
 from telegram.constants import ParseMode
+from openai.error import InvalidRequestError
 import telegram
 from telegram import (
     Update,
@@ -48,14 +50,15 @@ user_semaphores = {}
 user_tasks = {}
 
 HELP_MESSAGE = """Commands:
-🟣 /retry – Regenerate last bot answer
-🟣 /new – Start new dialog
-🟣 /mode – Select chat mode
-🟣 /subscribe – Renew subscription
-🟣 /balance – Show remaining days
-🟣 /help – Show help
+🔄 /retry – Regenerate last bot answer
+🆕 /new – Start new dialog
+🔀 /mode – Select chat mod
+*️⃣ /settings - Show available models\n
+🔔 /subscribe – Renew subscription
+⏳ /balance – Show remaining days
+❓ /help – Show help
 
-🎨 Generate images from text in:\n <b> Artist</b> /mode
+🎨 Generate images from text in:\n <b>Artist</b> /mode
 👥 Add bot to <b>group chat</b>:\n /help_group_chat
 """
 
@@ -130,20 +133,23 @@ async def successful_payment_callback(update: Update, context: CallbackContext):
     user_id = update.message.chat.id
     # Add 30 delightful days to the user's subscription as a sign of our gratitude
     end_date = datetime.now() + timedelta(days=30)
-    db.update_user_subscription(user_id, end_date)  # Our database gets the good news too
+    db.update_user_subscription(user_id, end_date, is_trial=False)  # Our database gets the good news too
 
     # Craft a warm and welcoming confirmation message
     confirmation_message = (
-        "🌟 Hooray! We recived your payment! 🌟\n\n"
+        "🌟Hooray! We received your payment!🌟\n\n"
         "We're absolutely thrilled to have you continue this journey with us. \n"
         "Your subscription has been extended! \n"
         "You can check the remaining days at any time by clicking /balance \n\n"
         "Thank you for your support, and enjoy your enhanced experience with us! 💫"
     )
 
+    # Log right before sending the message
+    logger.info(f"Sending confirmation message: {confirmation_message}")
 
     # Send the crafted message to the user's chat
-    await update.message.reply_text(confirmation_message)
+    await update.message.reply_text(confirmation_message, parse_mode=ParseMode.HTML)
+
 
 
 
@@ -171,7 +177,7 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
     n_used_tokens = db.get_user_attribute(user.id, "n_used_tokens")
     if isinstance(n_used_tokens, int) or isinstance(n_used_tokens, float):  # old format
         new_n_used_tokens = {
-            "gpt-3.5-turbo": {
+            "gpt-4-mini": {
                 "n_input_tokens": 0,
                 "n_output_tokens": n_used_tokens
             }
@@ -185,6 +191,11 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
     # image generation
     if db.get_user_attribute(user.id, "n_generated_images") is None:
         db.set_user_attribute(user.id, "n_generated_images", 0)
+
+    # Update subscription for a new user
+    if db.get_user_subscription(user.id) is None:
+        trial_end_date = datetime.now() + timedelta(days=1)
+        db.update_user_subscription(user.id, trial_end_date, is_trial=True)
 
 
 async def is_bot_mentioned(update: Update, context: CallbackContext):
@@ -208,40 +219,43 @@ async def is_bot_mentioned(update: Update, context: CallbackContext):
 
 async def start_handle(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    channel_username = 'VodichkaGPT'  # Your channel's username without '@'
+
+    # Check if the user is new or returning
+    is_new_user = not db.check_if_user_exists(user_id)
+
+    # Register user and start their free trial if they're new
+    await register_user_if_not_exists(update, context, update.message.from_user)
 
     # Check if the user is already a subscriber to the channel
     try:
-        status = await context.bot.get_chat_member(chat_id=f"@{channel_username}", user_id=user_id)
+        status = await context.bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
         is_subscriber = status.status in ["member", "creator", "administrator"]
     except Exception as e:
         logging.error("Could not fetch the chat member status.", exc_info=e)
-        is_subscriber = False  # Assume not a subscriber if there's an error
+        is_subscriber = False
 
     if not is_subscriber:
-        # The user is not a subscriber. Send a message with instructions to subscribe.
         message = (
-            "Hello! To use this bot, you need to join our channel first.\n\n"
-            "Please [join our channel](https://t.me/VodichkaGPT) and then press /start again."
+            "🌟 Welcome to VodichkaGPT! 🌟\n\n"
+            "Please join our channel first. "
+            "It's just a click away!\n\n"
+            "👉 [Join Our Channel](https://t.me/VodichkaGPT)\n\n"
+            "After joining, simply hit /start to begin exploring all the amazing features.\n\n"
         )
-        keyboard = [
-            [InlineKeyboardButton("Join Channel", url="https://t.me/VodichkaGPT")]
-        ]
+        if is_new_user:
+            message += "🎉 You have *one-day free trial*! 🎉"
+        keyboard = [[InlineKeyboardButton("🔗 Join Channel 🔗", url="https://t.me/VodichkaGPT")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # The user is a subscriber, proceed with the rest of the start command.
-    await register_user_if_not_exists(update, context, update.message.from_user)
+    # Greeting new or returning user
+    greeting_text = "Hi! I'm <b>VodichkaGPT!</b>\nBot powered by GPT 4o.\n\n"
+    greeting_text += HELP_MESSAGE
+    greeting_text += "\nFeel free to ask me anything!"
 
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    db.start_new_dialog(user_id)
-
-    reply_text = "Hi! I'm <b>VodichkaGPT</b> bot powered by GPT-3.5 Turbo\n\n"
-    reply_text += HELP_MESSAGE
-    reply_text += "\nFeel free to ask me anything!"
-
-    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
+    
+    await update.message.reply_text(greeting_text, parse_mode=ParseMode.HTML)
     await show_chat_modes_handle(update, context)
 
 
@@ -325,20 +339,21 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         _message = _message.replace("@" + context.bot.username, "").strip()
 
     await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+    if await is_previous_message_not_answered_yet(update, context):
+        return
 
     user_id = update.message.from_user.id
 
-        # Check if the user has an active subscription
+    # Check if the user has an active subscription
     subscription = db.get_user_subscription(user_id)
     if subscription is None or subscription['end_date'] < datetime.now():
-        message = (
+        subscription_message = (
             "🚫 <b>Access Denied:</b> It looks like you don't have an active subscription.\n\n"
             "💡 To continue enjoying our services, please subscribe.\n"
             "🔗 Just tap on /subscribe to get started!"
         )
-    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
-    return
+        await update.message.reply_text(subscription_message, parse_mode=ParseMode.HTML)
+        return
 
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
 
@@ -358,6 +373,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
         n_input_tokens, n_output_tokens = 0, 0
         current_model = db.get_user_attribute(user_id, "current_model")
 
+        # Initialize n_first_dialog_messages_removed
+        n_first_dialog_messages_removed = 0
+
         try:
             # send placeholder message to user
             placeholder_message = await update.message.reply_text("...")
@@ -366,8 +384,8 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.chat.send_action(action="typing")
 
             if _message is None or len(_message) == 0:
-                 await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
-                 return
+                await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
+                return
 
             dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
             parse_mode = {
@@ -379,16 +397,19 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             if config.enable_message_streaming:
                 gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode)
             else:
-                answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
+                response = await chatgpt_instance.send_message(
                     _message,
                     dialog_messages=dialog_messages,
                     chat_mode=chat_mode
                 )
 
-                async def fake_gen():
-                    yield "finished", answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed
+                # Ensure response is in the correct format
+                if isinstance(response, tuple) and len(response) == 3 and isinstance(response[1], tuple) and len(response[1]) == 2:
+                    answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = response
+                else:
+                    raise ValueError(f"Unexpected response format: {response}")
 
-                gen = fake_gen()
+                gen = async_generator(answer, n_input_tokens, n_output_tokens, n_first_dialog_messages_removed)
 
             prev_answer = ""
             async for gen_item in gen:
@@ -420,18 +441,17 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 dialog_id=None
             )
 
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
+        except ValueError as ve:
+            logger.error(f"ValueError: {ve}")
+            await update.message.reply_text("Error: Unexpected response format. Please try again.")
 
         except asyncio.CancelledError:
-            # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
-            db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
             raise
 
         except Exception as e:
             error_text = f"Something went wrong during completion. Reason: {e}"
             logger.error(error_text)
             await update.message.reply_text(error_text)
-            return
 
         # send message if some messages were removed from the context
         if n_first_dialog_messages_removed > 0:
@@ -456,6 +476,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                 del user_tasks[user_id]
 
 
+
 async def is_previous_message_not_answered_yet(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
 
@@ -468,37 +489,92 @@ async def is_previous_message_not_answered_yet(update: Update, context: Callback
     else:
         return False
 
-        
+async def unsupport_message_handle(update: Update, context: CallbackContext, message=None):
+    error_text = f"I don't know how to read files or videos. Send the picture in normal mode (Quick Mode)."
+    logger.error(error_text)
+    await update.message.reply_text(error_text)
+    return
+    
 async def image_message_handle(update: Update, context: CallbackContext):
+    # Register user if not already registered
     await register_user_if_not_exists(update, context, update.message.from_user)
-    if await is_previous_message_not_answered_yet(update, context): return
+    
+    # Check if the previous message is still being processed
+    if await is_previous_message_not_answered_yet(update, context):
+        return
 
     user_id = update.message.from_user.id
-    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+    current_model = db.get_user_attribute(user_id, "current_model")  # Ensure this contains the correct model
+    chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
 
-    # Get the highest resolution photo available
-    image = max(update.message.photo, key=lambda x: x.width * x.height)
+    # If the user is in "Artist" chat mode, notify them to switch and return
+    if chat_mode == "artist":
+        await update.message.reply_text("Switch to VodichkaGPT for image recognition", reply_to_message_id=update.message.message_id)
+        return
 
-    # Download the image
+    # Handle image messages and store the image temporarily
+    photo = update.message.photo[-1]  # Get the highest resolution photo
+    image_file = await context.bot.get_file(photo.file_id)
+
+    # Extract caption if provided
+    image_caption = update.message.caption if update.message.caption else "Describe the contents of this image clearly and concisely. Focus on identifying key objects, text, or visual elements. If there is any math task or a problem solve it providing correct answer shoving few breef steps in plain text. Always double check before answering! Remember to NEVER use special symbols like LaTeX-style math notation. Remember to never use Do not use any bold text, headings, or formatting. Instead, use words like 'percent', 'multiplied by', and 'divided by'. Or %, ×, ÷. Make your answer as short as u can, whole answer must always fit one telegram message containing not more than 37 lines and 3400 characters. Always make it easily readable. Never brake these rules!"
+
+
+    # Use a temporary directory to store the image
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir = Path(tmp_dir)
         image_path = tmp_dir / "image.jpg"
         
-        image_file = await context.bot.get_file(image.file_id)
+        # Download the image to the temporary directory
         await image_file.download_to_drive(image_path)
 
-        # OCR the image
-        text = ocr_image(str(image_path))
+        # Function to encode the image to base64
+        def encode_image(image_path):
+            with open(image_path, "rb") as image_file:
+                return base64.b64encode(image_file.read()).decode('utf-8')
 
+        # Encode the image to base64
+        base64_image = encode_image(image_path)
 
-    if text:
-        temp_text = f"📸: <i>{text}</i>"
-        await update.message.reply_text(temp_text, parse_mode=ParseMode.HTML)
-        
-    else:
-        await update.message.reply_text("I couldn't recognize any text in the image.")
+        # Prepare headers and payload for OpenAI API, using the API key from config directly
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {config.openai_api_key}"  # Refer to the API key in config directly
+        }
 
-    await message_handle(update, context, message=text)
+        # Prepare the payload to include the caption as part of the prompt
+        payload = {
+            "model": current_model,  # Use the selected model (GPT-4-Mini or GPT-4o)
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": image_caption  # Use the image caption as part of the prompt
+                        },
+                        {
+                            "type": "image_url",  # Use 'image_url' instead of 'image'
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 300
+        }
+
+        # Make the request to OpenAI API
+        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+
+        # Check if the response is successful
+        if response.status_code == 200:
+            description = response.json()["choices"][0]["message"]["content"]
+            await update.message.reply_text(f"🖼️: {description}", parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+        else:
+            await update.message.reply_text(f"Error processing the image: {response.status_code}. {response.json()}", parse_mode=ParseMode.HTML, reply_to_message_id=update.message.message_id)
+
 
 async def voice_message_handle(update: Update, context: CallbackContext):
     # check if bot was mentioned (for group chats)
@@ -537,24 +613,51 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
     user_id = update.message.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
 
-    await update.message.chat.send_action(action="upload_photo")
+    # Check if the user is on trial
+    subscription = db.get_user_subscription(user_id)
+    is_on_trial = subscription.get("is_trial", False)
 
+    if is_on_trial:
+        # If on trial, calculate remaining image generation limit
+        trial_image_limit = 3
+        current_images_generated = db.get_user_attribute(user_id, "n_generated_images")
+        remaining_limit = trial_image_limit - current_images_generated
+
+        if remaining_limit <= 0:
+            # User has reached the limit of images that can be generated during the trial period
+            text = "You've reached your image generation limit of <b>3 images</b> during the trial.\nTo continue creating, please consider our subscription options."
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            return
+        else:
+            # Limit the number of images to the remaining trial limit
+            config.return_n_generated_images = min(config.return_n_generated_images, remaining_limit)
+    else:
+        # Non-trial users have no limit, so use the configured default
+        config.return_n_generated_images = config.return_n_generated_images
+
+    # token usage
+    db.set_user_attribute(user_id, "n_generated_images", config.return_n_generated_images + db.get_user_attribute(user_id, "n_generated_images"))
+
+    await update.message.chat.send_action(action="upload_photo")
     message = message or update.message.text
 
     try:
+        # Attempt to generate images with the adjusted limit for trial users, or no limit for non-trial users
         image_urls = await openai_utils.generate_images(message, n_images=config.return_n_generated_images, size=config.image_size)
     except openai.error.InvalidRequestError as e:
         if str(e).startswith("Your request was rejected as a result of our safety system"):
-            text = "🥲 Your request <b>doesn't comply</b> with VodichkaGPT's usage policies.\nWhat did you write there, huh?"
+            text = "🥲 Your request <b>doesn't comply</b> with our usage policies.\nPlease adjust your request and try again."
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
             return
         else:
             raise
 
-    # token usage
-    db.set_user_attribute(user_id, "n_generated_images", config.return_n_generated_images + db.get_user_attribute(user_id, "n_generated_images"))
+    # Update the number of generated images in the database for trial users
+    if is_on_trial:
+        db.set_user_attribute(user_id, "n_generated_images", current_images_generated + len(image_urls))
 
-    for i, image_url in enumerate(image_urls):
+    # Send the images to the user
+    for image_url in image_urls:
         await update.message.chat.send_action(action="upload_photo")
         await update.message.reply_photo(image_url, parse_mode=ParseMode.HTML)
 
@@ -677,12 +780,17 @@ async def set_chat_mode_handle(update: Update, context: CallbackContext):
 
 def get_settings_menu(user_id: int):
     current_model = db.get_user_attribute(user_id, "current_model")
+
+    # Fallback to a default model if the current_model is not available in the config
+    if current_model not in config.models["info"]:
+        current_model = "default_model_key"  # Replace with the key of your default model
+
     text = config.models["info"][current_model]["description"]
 
     text += "\n\n"
     score_dict = config.models["info"][current_model]["scores"]
     for score_key, score_value in score_dict.items():
-        text += "🟣" * score_value + "⚪️" * (5 - score_value) + f" – {score_key}\n\n"
+        text += "🟣" * score_value + "⚪" * (5 - score_value) + f" – {score_key}\n\n"
 
     text += "\nSelect <b>model</b>:"
 
@@ -699,7 +807,6 @@ def get_settings_menu(user_id: int):
     reply_markup = InlineKeyboardMarkup([buttons])
 
     return text, reply_markup
-
 
 async def settings_handle(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
@@ -733,19 +840,34 @@ async def set_settings_handle(update: Update, context: CallbackContext):
 
 async def show_subscription_status(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    subscription_info = db.get_user_subscription(user_id)
-    if subscription_info:
-        end_date = subscription_info['end_date']
-        days_left = (end_date - datetime.now()).days
-        if days_left > 0:
-            text = f"🔔 <b>Subscription Status:</b> Active 🟢\n📅 <b>Days Remaining:</b> {days_left}"
-        else:
-            text = f"🔔 <b>Subscription Status:</b> Expired 🔴\n⚠️ Please renew your subscription."
-    else:
-        text = f"🔔 <b>Subscription Status:</b> None 🔘\nℹ️ You do not have an active subscription."
-    
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    try:
+        subscription_info = db.get_user_attribute(user_id, 'subscription')
 
+        if not subscription_info:
+            text = "🔔 <b>Subscription Status:</b> None 🔘\nℹ️ You do not have an active subscription."
+        else:
+            end_date = subscription_info.get('end_date')
+            is_trial = subscription_info.get('is_trial', False)
+
+            # Convert end_date to a datetime object if it's not already one
+            if isinstance(end_date, str):
+                end_date = datetime.strptime(end_date, '%Y-%m-%dT%H:%M:%S.%fZ')
+
+            now = datetime.now()
+            days_left = (end_date - now).days
+
+            if days_left >= 0 and is_trial:
+                
+                # Special handling for trial subscriptions on their last day
+                text = "🔔 <b>Subscription Status:</b> Trial 🟢\n📅 <b>Days Remaining:</b> 1"
+            elif days_left > 0:
+                text = f"🔔 <b>Subscription Status:</b> Active 🟢\n📅 <b>Days Remaining:</b> {days_left}"
+            else:
+                text = "🔔 <b>Subscription Status:</b> Expired 🔴\n⚠️ Please renew your subscription."
+    except Exception as e:
+        text = f"🔔 Error while retrieving subscription status: {str(e)}"
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def edited_message_handle(update: Update, context: CallbackContext):
@@ -783,6 +905,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("/new", "Start new dialog"),
         BotCommand("/mode", "Select chat mode"),
+	BotCommand("/settings", "Show available models"),
         BotCommand("/retry", "Re-generate response for previous query"),
         BotCommand("/subscribe", "Renew subscription"),
         BotCommand("/balance", "Show remaining days"),
@@ -820,7 +943,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("cancel", cancel_handle, filters=user_filter))
 
     application.add_handler(MessageHandler(filters.VOICE & user_filter, voice_message_handle))
-    application.add_handler(MessageHandler(filters.PHOTO & user_filter, image_message_handle))
+    # application.add_handler(MessageHandler(filters.PHOTO & user_filter, image_message_handle))
 
     application.add_handler(CommandHandler("mode", show_chat_modes_handle, filters=user_filter))
     application.add_handler(CallbackQueryHandler(show_chat_modes_callback_handle, pattern="^show_chat_modes"))
@@ -833,8 +956,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("subscribe", subscribe_handle, filters=user_filter))
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT & user_filter, successful_payment_callback))
-
-
+    application.add_handler(MessageHandler(filters.PHOTO & user_filter, image_message_handle))
     application.add_error_handler(error_handle)
 
     # start the bot
